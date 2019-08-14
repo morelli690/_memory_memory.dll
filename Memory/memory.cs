@@ -141,6 +141,9 @@ namespace Memory
         [DllImport("kernel32.dll")]
         private static extern bool ReadProcessMemory(IntPtr hProcess, UIntPtr lpBaseAddress, [Out] byte[] lpBuffer, UIntPtr nSize, out ulong lpNumberOfBytesRead);
 
+        [DllImport("kernel32.dll")]
+        private static extern bool ReadProcessMemory(IntPtr hProcess, UIntPtr lpBaseAddress, [Out] IntPtr lpBuffer, UIntPtr nSize, out ulong lpNumberOfBytesRead);
+
         [DllImport("kernel32.dll", SetLastError = true, ExactSpelling = true)]
         static extern UIntPtr VirtualAllocEx(
             IntPtr hProcess,
@@ -211,6 +214,7 @@ namespace Memory
         const uint MEM_COMMIT = 0x00001000;
         const uint MEM_RESERVE = 0x00002000;
 
+        private const uint PAGE_READONLY = 0x02;
         const uint PAGE_READWRITE = 0x04;
         const uint PAGE_WRITECOPY = 0x08;
         private const uint PAGE_EXECUTE_READWRITE = 0x40;
@@ -230,7 +234,7 @@ namespace Memory
         /// The process handle that was opened. (Use OpenProcess function to populate this variable)
         /// </summary>
         public IntPtr pHandle;
-
+        Dictionary<string, CancellationTokenSource> FreezeTokenSrcs = new Dictionary<string, CancellationTokenSource>();
         public Process theProc = null;
 
         internal enum MINIDUMP_TYPE
@@ -260,6 +264,64 @@ namespace Memory
                     return false;
             }
             return true;
+        }
+
+        /// <summary>
+        /// Freeze a value to an address.
+        /// </summary>
+        /// <param name="address">Your address</param>
+        /// <param name="type">byte, 2bytes, bytes, float, int, string, double or long.</param>
+        /// <param name="value">Value to freeze</param>
+        /// <param name="file">ini file to read address from (OPTIONAL)</param>
+        public void FreezeValue(string address, string type, string value, string file = "")
+        {
+            CancellationTokenSource cts = new CancellationTokenSource();
+            
+            if (FreezeTokenSrcs.ContainsKey(address))
+            {
+                Debug.WriteLine("Changing Freezing Address " + address + " Value " + value);
+                try
+                {
+                    FreezeTokenSrcs[address].Cancel();
+                    FreezeTokenSrcs.Remove(address);
+                }
+                catch
+                {
+                    Debug.WriteLine("ERROR: Avoided a crash. Address " + address + " was not frozen.");
+                }
+            }
+            else 
+                Debug.WriteLine("Adding Freezing Address " + address + " Value " + value);
+
+            FreezeTokenSrcs.Add(address, cts);
+
+            Task.Factory.StartNew(() =>
+            {
+                while (!cts.Token.IsCancellationRequested)
+                {
+                    writeMemory(address, type, value, file);
+                    Thread.Sleep(25);
+                }
+            },
+            cts.Token);
+        }
+
+        /// <summary>
+        /// Unfreeze a frozen value at an address
+        /// </summary>
+        /// <param name="address">address where frozen value is stored</param>
+        public void UnfreezeValue(string address)
+        {
+            Debug.WriteLine("Un-Freezing Address " + address);
+            try
+            {
+                FreezeTokenSrcs[address].Cancel();
+                FreezeTokenSrcs.Remove(address);
+            }
+            catch
+            {
+                Debug.WriteLine("ERROR: Address " + address + " was not frozen.");
+            }
         }
 
         /// <summary>
@@ -778,15 +840,42 @@ namespace Memory
         /// <returns></returns>
         public int readByte(string code, string file = "")
         {
-            byte[] memoryTiny = new byte[4];
+            byte[] memoryTiny = new byte[1];
 
-            UIntPtr theCode;
-            theCode = getCode(code, file);
+            UIntPtr theCode = getCode(code, file);
 
-            if (ReadProcessMemory(pHandle, theCode, memoryTiny, (UIntPtr)1, IntPtr.Zero))
-                return BitConverter.ToInt32(memoryTiny, 0);
-            else
-                return 0;
+            if (ReadProcessMemory(pHandle, theCode, memoryTiny, (UIntPtr) 1, IntPtr.Zero))
+                return memoryTiny[0];
+
+            return 0;
+        }
+
+        /// <summary>
+        /// Reads a byte from memory and splits it into bits
+        /// </summary>
+        /// <param name="code">address, module + pointer + offset, module + offset OR label in .ini file.</param>
+        /// <param name="file">path and file name of ini file. (OPTIONAL)</param>
+        /// <returns>Array of 8 booleans representing each bit of the byte read</returns>
+        public bool[] readBits(string code, string file = "")
+        {
+            byte[] buf = new byte[1];
+
+            UIntPtr theCode = getCode(code, file);
+
+            bool[] ret = new bool[8];
+
+            if (!ReadProcessMemory(pHandle, theCode, buf, (UIntPtr) 1, IntPtr.Zero))
+                return ret;
+            
+
+            if (!BitConverter.IsLittleEndian)
+                throw new Exception("Should be little endian");
+
+            for (var i = 0; i < 8; i++)
+                ret[i] = Convert.ToBoolean(buf[0] & (1 << i));
+
+            return ret;
+
         }
 
         public int readPByte(UIntPtr address, string code, string file = "")
@@ -986,6 +1075,30 @@ namespace Memory
         }
 
         /// <summary>
+        /// Takes an array of 8 booleans and writes to a single byte
+        /// </summary>
+        /// <param name="code">address to write to</param>
+        /// <param name="bits">Array of 8 booleans to write</param>
+        /// <param name="file">path and name of ini file. (OPTIONAL)</param>
+        public void writeBits(string code, bool[] bits, string file = "")
+        {
+            if(bits.Length != 8)
+                throw new ArgumentException("Not enough bits for a whole byte", nameof(bits));
+
+            byte[] buf = new byte[1];
+
+            UIntPtr theCode = getCode(code, file);
+
+            for (var i = 0; i < 8; i++)
+            {
+                if (bits[i])
+                    buf[0] |= (byte)(1 << i);
+            }
+
+            WriteProcessMemory(pHandle, theCode, buf, (UIntPtr) 1, IntPtr.Zero);
+        }
+
+        /// <summary>
         /// Write byte array to address
         /// </summary>
         /// <param name="address">Address to write to</param>
@@ -1023,10 +1136,15 @@ namespace Memory
             {
                 //Debug.WriteLine("ERROR: LoadCode returned blank. NAME:" + name + " PATH:" + path);
                 return UIntPtr.Zero;
-            } else
+            }
+            else
             {
                 //Debug.WriteLine("Found code=" + theCode + " NAME:" + name + " PATH:" + path);
             }
+
+            // remove spaces
+            if (theCode.Contains(" "))
+                theCode.Replace(" ", String.Empty);
 
             if (!theCode.Contains("+") && !theCode.Contains(",")) return new UIntPtr(Convert.ToUInt32(theCode, 16));
 
@@ -1152,6 +1270,11 @@ namespace Memory
 
             if (theCode == "")
                 return UIntPtr.Zero;
+
+            // remove spaces
+            if (theCode.Contains(" "))
+                theCode.Replace(" ", String.Empty);
+
             string newOffsets = theCode;
             if (theCode.Contains("+"))
                 newOffsets = theCode.Substring(theCode.IndexOf('+') + 1);
@@ -1714,10 +1837,25 @@ namespace Memory
         /// <param name="executable">Include executable addresses in scan</param>
         /// <param name="file">ini file (OPTIONAL)</param>
         /// <returns>IEnumerable of all addresses found.</returns>
-        public async Task<IEnumerable<long>> AoBScan(string search, bool writable = false, bool executable = true, string file = "")
+        public Task<IEnumerable<long>> AoBScan(string search, bool writable = false, bool executable = true, string file = "")
         {
-            return await AoBScan(0, long.MaxValue, search, writable, executable, file);
+            return AoBScan(0, long.MaxValue, search, writable, executable, file);
         }
+
+        /// <summary>
+        /// Array of byte scan.
+        /// </summary>
+        /// <param name="search">array of bytes to search for, OR your ini code label.</param>
+        /// <param name="readable">Include readable addresses in scan</param>
+        /// <param name="writable">Include writable addresses in scan</param>
+        /// <param name="executable">Include executable addresses in scan</param>
+        /// <param name="file">ini file (OPTIONAL)</param>
+        /// <returns>IEnumerable of all addresses found.</returns>
+        public Task<IEnumerable<long>> AoBScan(string search, bool readable, bool writable, bool executable, string file = "")
+        {
+            return AoBScan(0, long.MaxValue, search, readable, writable, executable, file);
+        }
+
 
         /// <summary>
         /// Array of Byte scan.
@@ -1729,137 +1867,166 @@ namespace Memory
         /// <param name="writable">Include writable addresses in scan</param>
         /// <param name="executable">Include executable addresses in scan</param>
         /// <returns>IEnumerable of all addresses found.</returns>
-        public async Task<IEnumerable<long>> AoBScan(long start, long end, string search, bool writable = false, bool executable = true, string file = "")
+        public Task<IEnumerable<long>> AoBScan(long start, long end, string search, bool writable = false, bool executable = true, string file = "")
         {
-            var memRegionList = new List<MemoryRegionResult>();
+            // Not including read only memory was scan behavior prior.
+            return AoBScan(start, end, search, false, writable, executable, file);
+        }
 
-            string memCode = LoadCode(search, file);
-
-            string[] stringByteArray = memCode.Split(' ');
-            byte[] mask = new byte[stringByteArray.Length];
-
-            for (var i = 0; i < stringByteArray.Length; i++)
+        /// <summary>
+        /// Array of Byte scan.
+        /// </summary>
+        /// <param name="start">Your starting address.</param>
+        /// <param name="end">ending address</param>
+        /// <param name="search">array of bytes to search for, OR your ini code label.</param>
+        /// <param name="file">ini file (OPTIONAL)</param>
+        /// <param name="readable">Include readable addresses in scan</param>
+        /// <param name="writable">Include writable addresses in scan</param>
+        /// <param name="executable">Include executable addresses in scan</param>
+        /// <returns>IEnumerable of all addresses found.</returns>
+        public Task<IEnumerable<long>> AoBScan(long start, long end, string search, bool readable, bool writable, bool executable, string file = "")
+        {
+            return Task.Run(() =>
             {
-                string ba = stringByteArray[i];
+                var memRegionList = new List<MemoryRegionResult>();
 
-                if (ba == "??" || (ba.Length == 1 && ba == "?"))
+                string memCode = LoadCode(search, file);
+
+                string[] stringByteArray = memCode.Split(' ');
+
+                byte[] aobPattern = new byte[stringByteArray.Length];
+                byte[] mask = new byte[stringByteArray.Length];
+
+                for (var i = 0; i < stringByteArray.Length; i++)
                 {
-                    mask[i] = 0x00;
-                    stringByteArray[i] = "0x00";
-                }
-                else if (Char.IsLetterOrDigit(ba[0]) && ba[1] == '?')
-                {
-                    mask[i] = 0xF0;
-                    stringByteArray[i] = ba[0] + "0";
-                }
-                else if (Char.IsLetterOrDigit(ba[1]) && ba[0] == '?')
-                {
-                    mask[i] = 0x0F;
-                    stringByteArray[i] = "0" + ba[1];
-                }
-                else
-                    mask[i] = 0xFF;
-            }
+                    string ba = stringByteArray[i];
 
-            SYSTEM_INFO sys_info = new SYSTEM_INFO();
-            GetSystemInfo(out sys_info);
-
-            UIntPtr proc_min_address = sys_info.minimumApplicationAddress;
-            UIntPtr proc_max_address = sys_info.maximumApplicationAddress;
-
-            if (start < (long)proc_min_address.ToUInt64())
-                start = (long)proc_min_address.ToUInt64();
-
-            if (end > (long)proc_max_address.ToUInt64())
-                end = (long)proc_max_address.ToUInt64();
-
-            Debug.WriteLine("[DEBUG] memory scan starting... (min:0x" + proc_min_address.ToUInt64().ToString(mSize()) + " max:0x" + proc_max_address.ToUInt64().ToString(mSize()) + " time:" + DateTime.Now.ToString("h:mm:ss tt") + ")");
-            UIntPtr currentBaseAddress = new UIntPtr((ulong)start);
-
-            MEMORY_BASIC_INFORMATION memInfo = new MEMORY_BASIC_INFORMATION();
-
-            //Debug.WriteLine("[DEBUG] start:0x" + start.ToString("X8") + " curBase:0x" + currentBaseAddress.ToUInt64().ToString("X8") + " end:0x" + end.ToString("X8") + " size:0x" + memInfo.RegionSize.ToString("X8") + " vAloc:" + VirtualQueryEx(pHandle, currentBaseAddress, out memInfo).ToUInt64().ToString());
-
-            while (VirtualQueryEx(pHandle, currentBaseAddress, out memInfo).ToUInt64() != 0 &&
-                   currentBaseAddress.ToUInt64() < (ulong)end &&
-                   currentBaseAddress.ToUInt64() + (ulong)memInfo.RegionSize >
-                   currentBaseAddress.ToUInt64())
-            {
-                bool isValid = memInfo.State == MEM_COMMIT;
-                isValid &= memInfo.BaseAddress.ToUInt64() < (ulong)proc_max_address.ToUInt64();
-                isValid &= ((memInfo.Protect & PAGE_GUARD) == 0);
-                isValid &= ((memInfo.Protect & PAGE_NOACCESS) == 0);
-                isValid &= (memInfo.Type == MEM_PRIVATE) || (memInfo.Type == MEM_IMAGE);
-
-                if (isValid)
-                {
-                    bool isWritable = ((memInfo.Protect & PAGE_READWRITE) > 0) ||
-                                      ((memInfo.Protect & PAGE_WRITECOPY) > 0) ||
-                                      ((memInfo.Protect & PAGE_EXECUTE_READWRITE) > 0) ||
-                                      ((memInfo.Protect & PAGE_EXECUTE_WRITECOPY) > 0);
-
-                    bool isExecutable = ((memInfo.Protect & PAGE_EXECUTE) > 0) ||
-                                        ((memInfo.Protect & PAGE_EXECUTE_READ) > 0) ||
-                                        ((memInfo.Protect & PAGE_EXECUTE_READWRITE) > 0) ||
-                                        ((memInfo.Protect & PAGE_EXECUTE_WRITECOPY) > 0);
-
-                    isWritable &= writable;
-                    isExecutable &= executable;
-
-                    isValid &= isWritable || isExecutable;
-                }
-
-                if (!isValid)
-                {
-                    currentBaseAddress = new UIntPtr(memInfo.BaseAddress.ToUInt64() + (ulong)memInfo.RegionSize);
-                    continue;
-                }
-
-                MemoryRegionResult memRegion = new MemoryRegionResult
-                {
-                    CurrentBaseAddress = currentBaseAddress,
-                    RegionSize = memInfo.RegionSize,
-                    RegionBase = memInfo.BaseAddress
-                };
-
-                currentBaseAddress = new UIntPtr(memInfo.BaseAddress.ToUInt64() + (ulong)memInfo.RegionSize);
-
-                //Console.WriteLine("SCAN start:" + memRegion.RegionBase.ToString() + " end:" + currentBaseAddress.ToString());
-
-                if (memRegionList.Count > 0)
-                {
-                    var previousRegion = memRegionList[memRegionList.Count - 1];
-
-                    if ((long)previousRegion.RegionBase + previousRegion.RegionSize == (long)memInfo.BaseAddress)
+                    if (ba == "??" || (ba.Length == 1 && ba == "?"))
                     {
-                        memRegionList[memRegionList.Count - 1] = new MemoryRegionResult
-                        {
-                            CurrentBaseAddress = previousRegion.CurrentBaseAddress,
-                            RegionBase = previousRegion.RegionBase,
-                            RegionSize = previousRegion.RegionSize + memInfo.RegionSize
-                        };
+                        mask[i] = 0x00;
+                        stringByteArray[i] = "0x00";
+                    }
+                    else if (Char.IsLetterOrDigit(ba[0]) && ba[1] == '?')
+                    {
+                        mask[i] = 0xF0;
+                        stringByteArray[i] = ba[0] + "0";
+                    }
+                    else if (Char.IsLetterOrDigit(ba[1]) && ba[0] == '?')
+                    {
+                        mask[i] = 0x0F;
+                        stringByteArray[i] = "0" + ba[1];
+                    }
+                    else
+                        mask[i] = 0xFF;
+                }
 
+
+                for (int i = 0; i < stringByteArray.Length; i++)
+                    aobPattern[i] = (byte)(Convert.ToByte(stringByteArray[i], 16) & mask[i]);
+
+                SYSTEM_INFO sys_info = new SYSTEM_INFO();
+                GetSystemInfo(out sys_info);
+
+                UIntPtr proc_min_address = sys_info.minimumApplicationAddress;
+                UIntPtr proc_max_address = sys_info.maximumApplicationAddress;
+
+                if (start < (long)proc_min_address.ToUInt64())
+                    start = (long)proc_min_address.ToUInt64();
+
+                if (end > (long)proc_max_address.ToUInt64())
+                    end = (long)proc_max_address.ToUInt64();
+
+                Debug.WriteLine("[DEBUG] memory scan starting... (start:0x" + start.ToString(mSize()) + " end:0x" + end.ToString(mSize()) + " time:" + DateTime.Now.ToString("h:mm:ss tt") + ")");
+                UIntPtr currentBaseAddress = new UIntPtr((ulong)start);
+
+                MEMORY_BASIC_INFORMATION memInfo = new MEMORY_BASIC_INFORMATION();
+
+                //Debug.WriteLine("[DEBUG] start:0x" + start.ToString("X8") + " curBase:0x" + currentBaseAddress.ToUInt64().ToString("X8") + " end:0x" + end.ToString("X8") + " size:0x" + memInfo.RegionSize.ToString("X8") + " vAloc:" + VirtualQueryEx(pHandle, currentBaseAddress, out memInfo).ToUInt64().ToString());
+
+                while (VirtualQueryEx(pHandle, currentBaseAddress, out memInfo).ToUInt64() != 0 &&
+                       currentBaseAddress.ToUInt64() < (ulong)end &&
+                       currentBaseAddress.ToUInt64() + (ulong)memInfo.RegionSize >
+                       currentBaseAddress.ToUInt64())
+                {
+                    bool isValid = memInfo.State == MEM_COMMIT;
+                    isValid &= memInfo.BaseAddress.ToUInt64() < (ulong)proc_max_address.ToUInt64();
+                    isValid &= ((memInfo.Protect & PAGE_GUARD) == 0);
+                    isValid &= ((memInfo.Protect & PAGE_NOACCESS) == 0);
+                    isValid &= (memInfo.Type == MEM_PRIVATE) || (memInfo.Type == MEM_IMAGE);
+
+                    if (isValid)
+                    {
+                        bool isReadable = (memInfo.Protect & PAGE_READONLY) > 0;
+
+                        bool isWritable = ((memInfo.Protect & PAGE_READWRITE) > 0) ||
+                                          ((memInfo.Protect & PAGE_WRITECOPY) > 0) ||
+                                          ((memInfo.Protect & PAGE_EXECUTE_READWRITE) > 0) ||
+                                          ((memInfo.Protect & PAGE_EXECUTE_WRITECOPY) > 0);
+
+                        bool isExecutable = ((memInfo.Protect & PAGE_EXECUTE) > 0) ||
+                                            ((memInfo.Protect & PAGE_EXECUTE_READ) > 0) ||
+                                            ((memInfo.Protect & PAGE_EXECUTE_READWRITE) > 0) ||
+                                            ((memInfo.Protect & PAGE_EXECUTE_WRITECOPY) > 0);
+
+                        isReadable &= readable;
+                        isWritable &= writable;
+                        isExecutable &= executable;
+
+                        isValid &= isReadable || isWritable || isExecutable;
+                    }
+
+                    if (!isValid)
+                    {
+                        currentBaseAddress = new UIntPtr(memInfo.BaseAddress.ToUInt64() + (ulong)memInfo.RegionSize);
                         continue;
                     }
+
+                    MemoryRegionResult memRegion = new MemoryRegionResult
+                    {
+                        CurrentBaseAddress = currentBaseAddress,
+                        RegionSize = memInfo.RegionSize,
+                        RegionBase = memInfo.BaseAddress
+                    };
+
+                    currentBaseAddress = new UIntPtr(memInfo.BaseAddress.ToUInt64() + (ulong)memInfo.RegionSize);
+
+                    //Console.WriteLine("SCAN start:" + memRegion.RegionBase.ToString() + " end:" + currentBaseAddress.ToString());
+
+                    if (memRegionList.Count > 0)
+                    {
+                        var previousRegion = memRegionList[memRegionList.Count - 1];
+
+                        if ((long)previousRegion.RegionBase + previousRegion.RegionSize == (long)memInfo.BaseAddress)
+                        {
+                            memRegionList[memRegionList.Count - 1] = new MemoryRegionResult
+                            {
+                                CurrentBaseAddress = previousRegion.CurrentBaseAddress,
+                                RegionBase = previousRegion.RegionBase,
+                                RegionSize = previousRegion.RegionSize + memInfo.RegionSize
+                            };
+
+                            continue;
+                        }
+                    }
+
+                    memRegionList.Add(memRegion);
                 }
 
-                memRegionList.Add(memRegion);
-            }
+                ConcurrentBag<long> bagResult = new ConcurrentBag<long>();
 
-            ConcurrentBag<long> bagResult = new ConcurrentBag<long>();
+                Parallel.ForEach(memRegionList,
+                                 (item, parallelLoopState, index) =>
+                                 {
+                                     long[] compareResults = CompareScan(item, aobPattern, mask);
 
-            Parallel.ForEach(memRegionList,
-                             (item, parallelLoopState, index) =>
-                             {
-                                 long[] compareResults = CompareScan(item, stringByteArray, mask);
+                                     foreach (long result in compareResults)
+                                         bagResult.Add(result);
+                                 });
 
-                                 foreach (long result in compareResults)
-                                     bagResult.Add(result);
-                             });
+                Debug.WriteLine("[DEBUG] memory scan completed. (time:" + DateTime.Now.ToString("h:mm:ss tt") + ")");
 
-            Debug.WriteLine("[DEBUG] memory scan completed. (time:" + DateTime.Now.ToString("h:mm:ss tt") + ")");
-
-            return bagResult.ToList().OrderBy(c => c);
+                return bagResult.ToList().OrderBy(c => c).AsEnumerable();
+            });
         }
 
         /// <summary>
@@ -1874,33 +2041,34 @@ namespace Memory
         {
             long start = (long)getCode(code, file).ToUInt64();
 
-            return  (await AoBScan(start, end, search, true, true, file)).FirstOrDefault();
+            return  (await AoBScan(start, end, search, true, true, true, file)).FirstOrDefault();
         }
 
-        private long[] CompareScan(MemoryRegionResult item, string[] aobToFind, byte[] mask)
+        private long[] CompareScan(MemoryRegionResult item, byte[] aobPattern, byte[] mask)
         {
-            if (mask.Length != aobToFind.Length)
-                throw new ArgumentException($"{nameof(aobToFind)}.Length != {nameof(mask)}.Length");
+            if (mask.Length != aobPattern.Length)
+                throw new ArgumentException($"{nameof(aobPattern)}.Length != {nameof(mask)}.Length");
 
-            byte[] buffer = new byte[item.RegionSize];
+            IntPtr buffer = Marshal.AllocHGlobal((int)item.RegionSize);
+
             ReadProcessMemory(pHandle, item.CurrentBaseAddress, buffer, (UIntPtr)item.RegionSize, out ulong bytesRead);
 
-
-            byte[] aobPattern = new byte[aobToFind.Length];
-
-            for (int i = 0; i < aobToFind.Length; i++)
-                aobPattern[i] = (byte)(Convert.ToByte(aobToFind[i], 16) & mask[i]);
-
-            int result = 0 - aobToFind.Length;
+            int result = 0 - aobPattern.Length;
             List<long> ret = new List<long>();
-            do
+            unsafe
             {
-                result = FindPattern(buffer, aobPattern, mask, result + aobToFind.Length);
+                do
+                {
 
-                if (result >= 0)
-                    ret.Add((long)item.CurrentBaseAddress + result);
+                    result = FindPattern((byte*)buffer.ToPointer(), (int)bytesRead, aobPattern, mask, result + aobPattern.Length);
 
-            } while (result != -1);
+                    if (result >= 0)
+                        ret.Add((long) item.CurrentBaseAddress + result);
+
+                } while (result != -1);
+            }
+
+            Marshal.FreeHGlobal(buffer);
 
             return ret.ToArray();
         }
@@ -1913,6 +2081,36 @@ namespace Memory
                 pattern.Length > body.Length) return foundIndex;
 
             for (int index = start; index <= body.Length - pattern.Length; index++)
+            {
+                if (((body[index] & masks[0]) == (pattern[0] & masks[0])))
+                {
+                    var match = true;
+                    for (int index2 = 1; index2 <= pattern.Length - 1; index2++)
+                    {
+                        if ((body[index + index2] & masks[index2]) == (pattern[index2] & masks[index2])) continue;
+                        match = false;
+                        break;
+
+                    }
+
+                    if (!match) continue;
+
+                    foundIndex = index;
+                    break;
+                }
+            }
+
+            return foundIndex;
+        }
+
+        private unsafe int FindPattern(byte* body, int bodyLength, byte[] pattern, byte[] masks, int start = 0)
+        {
+            int foundIndex = -1;
+
+            if (bodyLength <= 0 || pattern.Length <= 0 || start > bodyLength - pattern.Length ||
+                pattern.Length > bodyLength) return foundIndex;
+
+            for (int index = start; index <= bodyLength - pattern.Length; index++)
             {
                 if (((body[index] & masks[0]) == (pattern[0] & masks[0])))
                 {
